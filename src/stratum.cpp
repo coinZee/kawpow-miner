@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <netdb.h>
 #include <vector>
+#include <thread>
+#include <chrono>
 #include "rapidjson/document.h"
 #include "rapidjson/writer.h"
 #include "rapidjson/stringbuffer.h"
@@ -19,6 +21,7 @@
 
 Stratum::Stratum(const Config& config, KawPow& kawpow) : config(config), kawpow(kawpow), sock(0) {
     LOG_INFO << "Initializing Stratum client";
+    kawpow.set_stratum(this);
 }
 
 void Stratum::run() {
@@ -28,27 +31,56 @@ void Stratum::run() {
     authorize();
 
     char buffer[4096];
+    memset(buffer, 0, sizeof(buffer));
+    size_t buffer_offset = 0;
+    
     LOG_INFO << "Entering main receive loop";
     while (true) {
         // Use poll to wait for data with a timeout
         struct pollfd fds;
         fds.fd = sock;
         fds.events = POLLIN;
-        int poll_result = poll(&fds, 1, 30000); // 30 second timeout
+        int poll_result = poll(&fds, 1, 5000); // 5 second timeout
         
         if (poll_result < 0) {
             LOG_ERROR << "Poll error: " << strerror(errno);
             break;
         } else if (poll_result == 0) {
             // Timeout - no data received
-            LOG_INFO << "No data received for 30 seconds, connection still active";
+            LOG_INFO << "No data received for 5 seconds, connection still active";
             continue;
         }
         
-        int bytes_received = recv(sock, buffer, sizeof(buffer), 0);
+        int bytes_received = recv(sock, buffer + buffer_offset, sizeof(buffer) - buffer_offset - 1, 0);
         if (bytes_received > 0) {
-            LOG_STRATUM << "Received " << bytes_received << " bytes";
-            handle_message(std::string(buffer, bytes_received));
+            buffer_offset += bytes_received;
+            buffer[buffer_offset] = '\0'; // Ensure null termination
+            
+            LOG_STRATUM << "Received " << bytes_received << " bytes, total buffer: " << buffer_offset << " bytes";
+            
+            // Process complete lines in the buffer
+            char* line_start = buffer;
+            char* line_end;
+            
+            while ((line_end = strstr(line_start, "\n")) != nullptr) {
+                *line_end = '\0'; // Replace newline with null terminator
+                std::string message(line_start);
+                
+                // Process the complete message
+                handle_message(message);
+                
+                // Move to the next line
+                line_start = line_end + 1;
+            }
+            
+            // Move any remaining incomplete data to the beginning of the buffer
+            if (line_start < buffer + buffer_offset) {
+                size_t remaining = buffer + buffer_offset - line_start;
+                memmove(buffer, line_start, remaining);
+                buffer_offset = remaining;
+            } else {
+                buffer_offset = 0;
+            }
         } else if (bytes_received == 0) {
             LOG_ERROR << "Connection closed by pool";
             LOG_INFO << "Attempting to reconnect...";
@@ -56,6 +88,7 @@ void Stratum::run() {
             connect();
             subscribe();
             authorize();
+            buffer_offset = 0;
         } else {
             LOG_ERROR << "Error receiving data: " << strerror(errno);
             if (errno == ECONNRESET || errno == ETIMEDOUT) {
@@ -64,6 +97,7 @@ void Stratum::run() {
                 connect();
                 subscribe();
                 authorize();
+                buffer_offset = 0;
             } else {
                 break;
             }
@@ -229,15 +263,15 @@ void Stratum::handle_message(const std::string& message) {
     }
 }
 
+
 void Stratum::process_single_message(const std::string& message) {
     LOG_STRATUM << "Processing JSON object: " << message;
-    
+
     rapidjson::Document doc;
     doc.Parse(message.c_str());
 
     if (doc.HasParseError()) {
-        LOG_ERROR << "Failed to parse stratum message: " << doc.GetParseError();
-        LOG_ERROR << "Error offset: " << doc.GetErrorOffset();
+        LOG_ERROR << "Failed to parse stratum message: " << doc.GetParseError() << " at offset " << doc.GetErrorOffset();
         LOG_ERROR << "Raw message: " << message;
         return;
     }
@@ -245,72 +279,100 @@ void Stratum::process_single_message(const std::string& message) {
     if (doc.HasMember("method")) {
         std::string method = doc["method"].GetString();
         LOG_STRATUM << "Received method: " << method;
-        
+
         if (method == "mining.notify" && doc.HasMember("params")) {
             const rapidjson::Value& params = doc["params"];
-            
-            // Add detailed debugging
-            LOG_INFO << "Params type: " << (params.IsArray() ? "array" : "not array") 
-                     << ", size: " << (params.IsArray() ? std::to_string(params.Size()) : "N/A");
-            
-            // Add bounds checking for minimum required parameters
-            if (!params.IsArray() || params.Size() < 7) {
-                LOG_ERROR << "Invalid mining.notify params format: expected at least 7 elements in array";
+
+            // We need at least 6 parameters for a valid KawPoW job
+            if (!params.IsArray() || params.Size() < 6) {
+                LOG_ERROR << "Invalid mining.notify params: expected at least 6 elements in array.";
                 return;
             }
+
+            // --- Safely parse all required job parameters from the pool message ---
+            std::string job_id = params[0].IsString() ? params[0].GetString() : "";
+            std::string header_hash = params[1].IsString() ? params[1].GetString() : "";
+            std::string seed_hash = params[2].IsString() ? params[2].GetString() : ""; // <-- The missing piece
+            bool clean_job = params[4].IsBool() ? params[4].GetBool() : true;
+            uint64_t block_number = params[5].IsUint64() ? params[5].GetUint64() : 0;
             
-            // Safe array access with bounds checking
-            if (params.Size() > 0 && params[0].IsString()) {
-                current_job_id = params[0].GetString();
-            } else {
-                LOG_ERROR << "Invalid job_id in mining.notify params";
+            if (job_id.empty() || header_hash.empty() || seed_hash.empty() || block_number == 0) {
+                LOG_ERROR << "Could not parse essential job parameters from mining.notify.";
                 return;
             }
-            
-            std::string header_hash;
-            if (params.Size() > 1 && params[1].IsString()) {
-                header_hash = params[1].GetString();
-            } else {
-                LOG_ERROR << "Invalid header_hash in mining.notify params";
-                return;
+
+            LOG_INFO << "New Job Received - ID: " << job_id << " Block: " << block_number;
+            LOG_STRATUM << "  Header Hash: " << header_hash;
+            LOG_STRATUM << "  Seed Hash:   " << seed_hash; // We have it!
+
+            // Stop any previous mining work
+            if (clean_job) {
+                kawpow.stop_mining();
             }
-            
-            uint64_t start_nonce = 0;
-            if (params.Size() > 7 && params[7].IsString()) {
-                try {
-                    start_nonce = std::stoull(params[7].GetString(), nullptr, 16);
-                } catch (const std::exception& e) {
-                    LOG_ERROR << "Failed to parse start_nonce: " << e.what();
-                    return;
-                }
-            } else {
-                LOG_WARN << "No start_nonce provided, using 0 as default";
-            }
-            
-            LOG_STRATUM << "New job received - ID: " << current_job_id 
-                       << ", Header hash: " << header_hash 
-                       << ", Start nonce: " << start_nonce;
-            
-            kawpow.set_job(current_job_id, header_hash, start_nonce);
+
+            // --- THIS IS THE CORRECTED FUNCTION CALL with all 5 arguments ---
+            kawpow.set_job(job_id, header_hash, seed_hash, block_number, current_target);
+
         } else if (method == "mining.set_target" && doc.HasMember("params")) {
             const rapidjson::Value& params = doc["params"];
             if (params.IsArray() && params.Size() > 0 && params[0].IsString()) {
-                LOG_STRATUM << "Target set to: " << params[0].GetString();
+                current_target = params[0].GetString();
+                LOG_STRATUM << "Target set to: " << current_target;
             }
         }
-    } else if (doc.HasMember("result")) {
-        const rapidjson::Value& result = doc["result"];
-        if (!result.IsNull() && result.IsArray() && result.Size() > 1) {
-            if (session_id.empty() && result[1].IsString()) {
-                session_id = result[1].GetString();
-                LOG_STRATUM << "Session ID received: " << session_id;
+    } else if (doc.HasMember("id") && doc.HasMember("result")) {
+        LOG_STRATUM << "Received response for request ID: " << doc["id"].GetInt();
+        
+        // Check for share submission response
+        if (doc["id"].GetInt() == 4) {
+            const rapidjson::Value& result = doc["result"];
+            if (result.IsBool()) {
+                if (result.GetBool()) {
+                    LOG_INFO << "Share accepted by pool";
+                } else {
+                    LOG_ERROR << "Share rejected by pool (result=false)";
+                    
+                    // Check for error details
+                    if (doc.HasMember("error") && !doc["error"].IsNull()) {
+                        const rapidjson::Value& error = doc["error"];
+                        if (error.IsArray() && error.Size() >= 2) {
+                            LOG_ERROR << "Error code: " << error[0].GetInt() 
+                                     << ", Message: " << error[1].GetString();
+                        } else {
+                            LOG_ERROR << "Unknown error format in response";
+                            LOG_ERROR << "Full response: " << message;
+                        }
+                    }
+                }
+            } else {
+                LOG_ERROR << "Unexpected result type for share submission: " 
+                         << (result.IsBool() ? "bool" : 
+                            (result.IsString() ? "string" : 
+                            (result.IsArray() ? "array" : 
+                            (result.IsObject() ? "object" : "unknown"))));
             }
-        }
-        if (doc.HasMember("id")) {
-            LOG_STRATUM << "Received response for request ID: " << doc["id"].GetInt();
+        } else if (doc["id"].GetInt() == 1 || doc["id"].GetInt() == 2) {
+            // Handle subscription or authorization responses
+            const rapidjson::Value& result = doc["result"];
+            if (!result.IsNull() && result.IsArray() && result.Size() > 1) {
+                if (session_id.empty() && result[1].IsString()) {
+                    session_id = result[1].GetString();
+                    LOG_STRATUM << "Session ID received: " << session_id;
+                }
+            }
         }
     } else if (doc.HasMember("error") && !doc["error"].IsNull()) {
-        LOG_ERROR << "Stratum error received: " << doc["error"].GetString();
+        LOG_ERROR << "Stratum error received:";
+        const rapidjson::Value& error = doc["error"];
+        if (error.IsArray() && error.Size() >= 2 && error[1].IsString()) {
+            LOG_ERROR << "Error code: " << error[0].GetInt() << ", Message: " << error[1].GetString();
+        } else if (error.IsObject() && error.HasMember("code") && error.HasMember("message")) {
+            LOG_ERROR << "Error code: " << error["code"].GetInt() << ", Message: " << error["message"].GetString();
+        } else {
+            LOG_ERROR << "Unknown error format";
+        }
+    } else {
+        LOG_ERROR << "Unrecognized message format: " << message;
     }
 }
 
@@ -360,29 +422,102 @@ void Stratum::authorize() {
     }
 }
 
-void Stratum::submit(const std::string& job_id, const std::string& nonce, const std::string& mix_hash) {
-    LOG_INFO << "Submitting share - Job ID: " << job_id << ", Nonce: " << nonce;
-    
+void Stratum::submit(
+    const std::string& job_id,
+    const std::string& nonce_hex,
+    const std::string& header_hash_raw,
+    const std::string& mix_hash_hex
+) {
     const PoolConfig& pool = config.getPools()[0];
+    LOG_INFO << "Submitting share - Job: " << job_id << ", Nonce: " << nonce_hex;
+
     rapidjson::Document d;
     d.SetObject();
     d.AddMember("id", 4, d.GetAllocator());
     d.AddMember("method", "mining.submit", d.GetAllocator());
+
     rapidjson::Value params(rapidjson::kArrayType);
+
+    // Wallet
     params.PushBack(rapidjson::Value(pool.user.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+
+    // Job ID
     params.PushBack(rapidjson::Value(job_id.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
-    params.PushBack(rapidjson::Value(nonce.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
-    params.PushBack(rapidjson::Value(mix_hash.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+
+    // Nonce (already padded)
+    std::string full_nonce = "0x" + nonce_hex;
+    params.PushBack(rapidjson::Value(full_nonce.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+
+    // Header hash (rebuild as 0x-prefixed hex string)
+    std::stringstream header_ss;
+    header_ss << "0x";
+    for (size_t i = 0; i < header_hash_raw.size(); ++i) {
+        header_ss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)header_hash_raw[i];
+    }
+    params.PushBack(rapidjson::Value(header_ss.str().c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+
+    // Mix hash (already formatted)
+    std::string full_mix = "0x" + mix_hash_hex;
+    params.PushBack(rapidjson::Value(full_mix.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+
     d.AddMember("params", params, d.GetAllocator());
 
+    // Serialize
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     d.Accept(writer);
     std::string msg = std::string(buffer.GetString()) + "\n";
-    
+
     LOG_STRATUM << "Sending share submission: " << msg;
+
     if (send(sock, msg.c_str(), msg.length(), 0) < 0) {
         LOG_ERROR << "Failed to submit share: " << strerror(errno);
     }
 }
+
+
+
+//
+// void Stratum::submit(const std::string& job_id, const std::string& nonce, const std::string& mix_hash) {
+//     LOG_INFO << "Submitting share - Job ID: " << job_id << ", Nonce: " << nonce;
+//
+//     const PoolConfig& pool = config.getPools()[0];
+//     rapidjson::Document d;
+//     d.SetObject();
+//     d.AddMember("id", 4, d.GetAllocator());
+//     d.AddMember("method", "mining.submit", d.GetAllocator());
+//     rapidjson::Value params(rapidjson::kArrayType);
+//
+//     // 1. Username/wallet
+//     params.PushBack(rapidjson::Value(pool.user.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+//
+//     // 2. Job ID
+//     params.PushBack(rapidjson::Value(job_id.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+//
+//     // 3. Nonce with 0x prefix
+//     std::string nonce_with_prefix = nonce;
+//     if (nonce_with_prefix.substr(0, 2) != "0x") {
+//         nonce_with_prefix = "0x" + nonce_with_prefix;
+//     }
+//     params.PushBack(rapidjson::Value(nonce_with_prefix.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+//
+//     // 4. Mix hash with 0x prefix
+//     std::string mix_hash_with_prefix = mix_hash;
+//     if (mix_hash_with_prefix.substr(0, 2) != "0x") {
+//         mix_hash_with_prefix = "0x" + mix_hash_with_prefix;
+//     }
+//     params.PushBack(rapidjson::Value(mix_hash_with_prefix.c_str(), d.GetAllocator()).Move(), d.GetAllocator());
+//
+//     d.AddMember("params", params, d.GetAllocator());
+//
+//     rapidjson::StringBuffer buffer;
+//     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+//     d.Accept(writer);
+//     std::string msg = std::string(buffer.GetString()) + "\n";
+//
+//     LOG_STRATUM << "Sending share submission: " << msg;
+//     if (send(sock, msg.c_str(), msg.length(), 0) < 0) {
+//         LOG_ERROR << "Failed to submit share: " << strerror(errno);
+//     }
+// }
 

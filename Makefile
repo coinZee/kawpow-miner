@@ -1,75 +1,75 @@
-#── Makefile ─────────────────────────────────────────────────
-# Sources
-CPP_SRCS := $(wildcard src/*.cpp) $(wildcard base/crypto/*.cpp) \
-            base/io/json/Json.cpp base/tools/String.cpp
-CU_SRCS  := src/kawpow.cu src/kernel.cu
-C_SRCS   := include/libethash/ethash_internal.c
-
-# Tools & flags
+# Compiler and flags
 CXX       := g++
 NVCC      := nvcc
-CUDA_ARCH := sm_80                            # adjust to your GPU
-INCDIRS   := -Iinclude -I. -I./include -Ibase # your headers
-CPPFLAGS  := -O3 -std=c++17 $(INCDIRS)        # C++ compile flags
+TARGET    := kawpow-miner
+OBJ_DIR   := build
 
-# MODIFIED: Added --cudart=static to CUFLAGS
-CUFLAGS   := -O3 -std=c++17 -arch=$(CUDA_ARCH) $(INCDIRS) --cudart=static
+# Include directories
+INCDIRS   := -Iinclude -I. -I./include -Ibase
 
-# MODIFIED: Added flags for static linking
-# You might need to add -lculibos and -ldl on some Linux systems
-LDFLAGS   := $(shell pkg-config --libs openssl) -lpthread
+# Compilation flags
+CPPFLAGS  := -O3 -std=c++17 $(INCDIRS) -Wall
+CUFLAGS   := -O3 -std=c++17 -arch=sm_80 -arch=sm_75 $(INCDIRS) --cudart=static
 
-# Build artifacts
-OBJ_DIR := build
-CU_OBJS := $(CU_SRCS:src/%.cu=$(OBJ_DIR)/%.o)
-CPP_OBJS:= $(patsubst %.cpp,$(OBJ_DIR)/%.o,$(notdir $(filter src/%.cpp,$(CPP_SRCS))))
-CRYPTO_OBJS := $(patsubst base/crypto/%.cpp,$(OBJ_DIR)/%.o,$(filter base/crypto/%.cpp,$(CPP_SRCS)))
-JSON_OBJS := $(OBJ_DIR)/Json.o
-STRING_OBJS := $(OBJ_DIR)/String.o
-C_OBJS  := $(OBJ_DIR)/ethash_internal.o
-ALL_OBJS:= $(CU_OBJS) $(CPP_OBJS) $(CRYPTO_OBJS) $(JSON_OBJS) $(STRING_OBJS) $(C_OBJS)
+# Linker flags - Tells g++ where to find the CUDA libraries
+LDFLAGS   := -L/usr/local/cuda/lib64 -lcudart_static -lpthread -ldl -lrt -lssl -lcrypto
 
-# Target binary
-TARGET := $(OBJ_DIR)/kawpow-miner
+# --- Source File Discovery ---
+# Automatically find all source files in their respective directories
+CPP_SOURCES := $(wildcard src/*.cpp) \
+               $(wildcard base/crypto/*.cpp) \
+               base/io/json/Json.cpp \
+               base/tools/String.cpp
+CU_SOURCES  := $(wildcard src/*.cu)
+C_SOURCES   := include/libethash/ethash_internal.c
 
-# Default
+# --- Object File List Generation (The Core Fix) ---
+# Create a list of .o files from the source lists, placing them in the build directory
+# $(notdir ...) gets the filename (e.g., main.cpp)
+# $(patsubst ...) replaces the extension (e.g., main.cpp -> main.o)
+# Then we prepend the build directory path.
+CPP_OBJS := $(addprefix $(OBJ_DIR)/, $(patsubst %.cpp,%.o,$(notdir $(CPP_SOURCES))))
+CU_OBJS  := $(addprefix $(OBJ_DIR)/, $(patsubst %.cu,%.o,$(notdir $(CU_SOURCES))))
+C_OBJS   := $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(notdir $(C_SOURCES))))
+
+ALL_OBJS := $(CPP_OBJS) $(CU_OBJS) $(C_OBJS)
+
+# --- Build Rules ---
+
+# Default rule: build the final executable
 all: $(TARGET)
 
-# Ensure build dir
+# Link the final executable from all the object files
+$(TARGET): $(ALL_OBJS)
+	@echo "Linking..."
+	$(CXX) $(ALL_OBJS) -o $@ $(LDFLAGS)
+	@echo "Build complete: $(TARGET)"
+
+# Generic rule to compile any .cpp file
+# VPATH tells make where to look for the source files
+VPATH := src base/crypto base/io/json base/tools
+$(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
+	@echo "Compiling C++: $<"
+	$(CXX) $(CPPFLAGS) -c $< -o $@
+
+# Generic rule to compile any .cu file
+VPATH += src
+$(OBJ_DIR)/%.o: %.cu | $(OBJ_DIR)
+	@echo "Compiling CUDA: $<"
+	$(NVCC) $(CUFLAGS) -c $< -o $@
+
+# Specific rule for the C file
+$(OBJ_DIR)/ethash_internal.o: include/libethash/ethash_internal.c | $(OBJ_DIR)
+	@echo "Compiling C: $<"
+	$(CXX) $(CPPFLAGS) -c $< -o $@
+
+# Rule to create the build directory
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
-# CUDA objs
-# MODIFIED: Changed -dc (device code) to -c (compile only) as we are not doing a separate device link step here.
-# If you needed separate compilation + device linking, the structure would be more complex.
-# For this project structure, a single link step is sufficient.
-$(OBJ_DIR)/%.o: src/%.cu | $(OBJ_DIR)
-	$(NVCC) $(CUFLAGS) -c $< -o $@
-
-# C++ objs
-VPATH := src:base/crypto
-$(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
-	$(CXX) $(CPPFLAGS) -c $< -o $@
-
-# JSON obj
-$(OBJ_DIR)/Json.o: base/io/json/Json.cpp | $(OBJ_DIR)
-	$(CXX) $(CPPFLAGS) -c $< -o $@
-
-# String obj
-$(OBJ_DIR)/String.o: base/tools/String.cpp | $(OBJ_DIR)
-	$(CXX) $(CPPFLAGS) -c $< -o $@
-
-# C obj for ethash
-$(C_OBJS): $(C_SRCS) | $(OBJ_DIR)
-	$(CXX) $(CPPFLAGS) -c $< -o $@
-
-
-# Link
-# MODIFIED: The final link step now uses the static flags passed via CUFLAGS
-$(TARGET): $(ALL_OBJS)
-	$(NVCC) $(ALL_OBJS) $(LDFLAGS) -o $@
-
+# Clean up build files
 clean:
-	rm -rf $(OBJ_DIR)
+	@echo "Cleaning up..."
+	rm -rf $(OBJ_DIR) $(TARGET)
 
 .PHONY: all clean
