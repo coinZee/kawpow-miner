@@ -91,7 +91,25 @@ __device__ static void keccak_f1600(uint64_t* state) {
 }
 
 // Global DAG cache
-struct DagCache { void* d_dag = nullptr; size_t size = 0; uint64_t epoch = UINT64_MAX; std::mutex mutex; };
+
+struct DagCache {
+    void* d_dag = nullptr;
+    size_t size = 0;
+    uint64_t epoch = UINT64_MAX;
+    std::mutex mutex;
+
+    // prevent copying
+    DagCache(const DagCache&) = delete;
+    DagCache& operator=(const DagCache&) = delete;
+
+    // allow moving
+    DagCache(DagCache&&) = default;
+    DagCache& operator=(DagCache&&) = default;
+
+    // default constructor
+    DagCache() = default;
+};
+
 
 static std::unordered_map<int, DagCache> g_dag_caches;
 static std::mutex g_dag_mutex;
@@ -338,90 +356,70 @@ __global__ void kawpow_kernel(
 // == DAG Management and Main Search Function
 // ===================================================================================
 void* get_dag(uint64_t block_number, const char* seed_hash_hex, uint64_t& dag_size, int device_id) {
-    // __constant__ uint32_t d_ravencoin_kawpow[15];
     uint64_t epoch = block_number / 7500;
-    std::lock_guard<std::mutex> lock(g_dag_cache.mutex);
-    
-    if (g_dag_cache.epoch == epoch && g_dag_cache.d_dag != nullptr) {
-        dag_size = g_dag_cache.size; 
-        return g_dag_cache.d_dag;
+
+    // 🔐 Step 1: Ensure a DagCache exists for this device
+    {
+        std::lock_guard<std::mutex> lock(g_dag_mutex);
+        g_dag_caches.try_emplace(device_id);
+
     }
-    
+
+    // 🔐 Step 2: Work with this device’s DAG cache
+    DagCache& cache = g_dag_caches[device_id];
+    std::lock_guard<std::mutex> lock(cache.mutex);
+
+    if (cache.epoch == epoch && cache.d_dag != nullptr) {
+        dag_size = cache.size;
+        return cache.d_dag;
+    }
+
     LOG_INFO << "Generating new DAG for epoch " << epoch << " (Block: " << block_number << ")";
-    
+
     size_t cache_size;
     void* h_cache = generate_kawpow_light_cache(epoch, seed_hash_hex, cache_size);
     if (!h_cache) return nullptr;
-    
+
     dag_size = get_kawpow_dag_size(epoch);
     LOG_INFO << "Calculated DAG size: " << dag_size / (1024 * 1024) << " MB";
-    
+
     // Clean up old DAG
-    if (g_dag_cache.d_dag != nullptr) {
-        cudaFree(g_dag_cache.d_dag);
+    if (cache.d_dag != nullptr) {
+        cudaFree(cache.d_dag);
     }
-    
+
     uint32_t* d_cache = nullptr;
     uint32_t* d_dag = nullptr;
-    cudaError_t err;
-    
-    // Allocate GPU memory
-    err = cudaMalloc(&d_dag, dag_size);
-    if (err != cudaSuccess) { 
-        LOG_ERROR << "GPU DAG Malloc failed: " << cudaGetErrorString(err); 
-        free(h_cache); 
-        return nullptr; 
+
+    if (cudaMalloc(&d_dag, dag_size) != cudaSuccess) {
+        LOG_ERROR << "GPU DAG Malloc failed";
+        free(h_cache);
+        return nullptr;
     }
-    
-    err = cudaMalloc(&d_cache, cache_size);
-    if (err != cudaSuccess) { 
-        LOG_ERROR << "GPU Cache Malloc failed: " << cudaGetErrorString(err); 
-        free(h_cache); 
-        cudaFree(d_dag); 
-        return nullptr; 
+
+    if (cudaMalloc(&d_cache, cache_size) != cudaSuccess) {
+        LOG_ERROR << "GPU Cache Malloc failed";
+        free(h_cache);
+        cudaFree(d_dag);
+        return nullptr;
     }
-    
-    // Copy cache to GPU
-    err = cudaMemcpy(d_cache, h_cache, cache_size, cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_cache, h_cache, cache_size, cudaMemcpyHostToDevice);
     free(h_cache);
-    if (err != cudaSuccess) { 
-        LOG_ERROR << "Cache copy to GPU failed: " << cudaGetErrorString(err); 
-        cudaFree(d_dag); 
-        cudaFree(d_cache); 
-        return nullptr; 
-    }
-    
-    LOG_INFO << "Launching DAG generation kernel on GPU...";
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    uint32_t num_dag_items = dag_size / 64;
-    uint32_t num_cache_items = cache_size / sizeof(uint32_t);
-    
+
     dim3 threads_per_block(256);
-    dim3 num_blocks((num_dag_items + threads_per_block.x - 1) / threads_per_block.x);
-    
-    generate_dag_kernel<<<num_blocks, threads_per_block>>>(d_dag, d_cache, num_dag_items, num_cache_items);
-    
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) { 
-        LOG_ERROR << "DAG generation kernel failed: " << cudaGetErrorString(err); 
-        cudaFree(d_dag); 
-        cudaFree(d_cache); 
-        return nullptr; 
-    }
-    
+    dim3 num_blocks((dag_size / 64 + 255) / 256);
+    generate_dag_kernel<<<num_blocks, threads_per_block>>>(d_dag, d_cache, dag_size / 64, cache_size / sizeof(uint32_t));
+    cudaDeviceSynchronize();
     cudaFree(d_cache);
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    LOG_INFO << "DAG generated in " << duration << " ms";
-    
-    g_dag_cache.epoch = epoch; 
-    g_dag_cache.size = dag_size; 
-    g_dag_cache.d_dag = d_dag;
-    
-    return g_dag_cache.d_dag;
+
+    cache.epoch = epoch;
+    cache.size = dag_size;
+    cache.d_dag = d_dag;
+
+    return d_dag;
 }
+
 struct uint256 {
     uint32_t val[8]; // little endian or big endian - be consistent
     
@@ -491,7 +489,8 @@ extern "C" void kawpow_cuda_search(
     dim3 num_blocks(intensity);
 
     // 1. Parse pool max target string (hardcoded or from mining.set_target)
-    std::string pool_max_target = "00000000ffff0000000000000000000000000000000000000000000000000000";
+    // std::string pool_max_target = "00000000ffff0000000000000000000000000000000000000000000000000000";
+    std::string pool_max_target = "00000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
     // 2. Convert to uint256 (or similar big int struct)
     uint256 max_target = parse_hex_to_uint256(pool_max_target);
