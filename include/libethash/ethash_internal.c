@@ -373,10 +373,11 @@ ethash_light_t ethash_light_new_internal(uint64_t cache_size, ethash_h256_t cons
 		return NULL;
 	}
 	ret->cache = malloc((size_t)cache_size);
+	node* nodes;
 	if (!ret->cache) {
 		goto fail_free_light;
 	}
-	node* nodes = (node*)ret->cache;
+	nodes = (node*)ret->cache;
 	if (!ethash_compute_cache_nodes(nodes, cache_size, seed)) {
 		goto fail_free_cache_mem;
 	}
