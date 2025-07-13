@@ -1,0 +1,22 @@
+{
+    "pools": [
+        {
+            "url": "stratum+tcp://xmr.kryptex.network:7029",
+            "user": "RKMHU6p7KLWRLkn64rP2Dg3oyNf2QV7RrN.worker_name",
+            "pass": "x"
+        }
+    ],
+    "cuda": {
+        "devices": [
+            {
+                "device_id": 0,
+                "intensity": 25
+            }
+        ]
+    },
+    "api": {
+        "port": 8080,
+        "enabled": true
+    }
+}
+
