@@ -1,0 +1,9 @@
+{
+  "image": "nvidia/cuda:11.0.3-devel-ubuntu16.04",
+  "features": {
+    "ghcr.io/devcontainers/features/nvidia-cuda:2": {
+      "installCuda": true,
+      "cudaVersion": "11.0.3"
+    }
+  }
+}
